@@ -1,0 +1,46 @@
+import cv2
+import os
+from tqdm import tqdm
+
+def create_video_from_images():
+    # Откуда берем картинки и куда сохраняем готовое видео
+    image_folder = r"D:\volley_stat\dataset_raw_frames"
+    video_name = r"D:\volley_stat\cvat_upload.mp4"
+    
+    if not os.path.exists(image_folder):
+        print(f"❌ Папка {image_folder} не найдена!")
+        return
+
+    # Собираем все .jpg файлы и обязательно сортируем, 
+    # чтобы мяч в видео летел плавно, а не телепортировался
+    images = [img for img in os.listdir(image_folder) if img.lower().endswith(".jpg")]
+    images.sort()
+    
+    if not images:
+        print("❌ В папке нет картинок!")
+        return
+
+    print(f"Найдено {len(images)} картинок. Начинаем сборку видео...")
+
+    # Читаем первую картинку, чтобы понять ширину и высоту будущего видео
+    first_image_path = os.path.join(image_folder, images[0])
+    frame = cv2.imread(first_image_path)
+    height, width, layers = frame.shape
+
+    # Настраиваем кодек (mp4v - стандарт для .mp4) и FPS
+    # FPS = 30 означает, что в 1 секунде видео будет 30 твоих картинок
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(video_name, fourcc, 30.0, (width, height))
+
+    # Запускаем цикл склейки с красивым прогресс-баром
+    for image in tqdm(images, desc="Склейка кадров", unit="кадр"):
+        img_path = os.path.join(image_folder, image)
+        video.write(cv2.imread(img_path))
+
+    # Обязательно закрываем файл, чтобы он сохранился и не побился
+    video.release()
+    print(f"\n🎉 Готово! Видео успешно сохранено по пути: {video_name}")
+
+if __name__ == "__main__":
+    create_video_from_images()
+    
