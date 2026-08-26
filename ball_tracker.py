@@ -3,11 +3,13 @@ import numpy as np
 from ultralytics import YOLO
 
 
-VIDEO_PATH = "YOLO_result.mp4"
+VIDEO_PATH = "trimmed_clip_short_2.mp4"
 YOLO_WEIGHTS = "runs/detect/train-18/weights/best.pt"
-CONF_THRESHOLD = 0.25
-OUTPUT_VIDEO = "tracked_output.mp4"
-OUTPUT_TRAJECTORY = "ball_trajectory.npy"
+CONF_THRESHOLD = 0.20
+IOU_THRESHOLD = 0.45
+IMG_SIZE = 1280 
+OUTPUT_VIDEO = "tracked_output_2.mp4"
+OUTPUT_TRAJECTORY = "ball_trajectory_2.npy"
 
 def main():
     model = YOLO(YOLO_WEIGHTS)
@@ -23,35 +25,82 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
 
-    trajectory = []  # [t, u, v] только для кадров, где мяч реально найден
+    trajectory = []
     current_time = 0.0
     frame_idx = 0
     found_count = 0
-
-    print("Обработка видео...")
+    
+    last_center = None
+    MAX_PIXEL_JUMP = 170.0  # Максимальное смещение центра мяча за 1 кадр
+    frames_lost = 0
+    MAX_LOST_FRAMES = 10
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model.predict(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+        results = model.predict(
+            frame,
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            imgsz=IMG_SIZE,
+            verbose=False
+        )[0]
 
-        if len(results.boxes) > 0:
+        # Проверяем, нашел ли YOLO хоть какие-то объекты 
+        if results.boxes is not None and len(results.boxes) > 0:
+            boxes = results.boxes.xyxy.cpu().numpy()
             confs = results.boxes.conf.cpu().numpy()
-            best_idx = confs.argmax()
-            x, y, w, h = results.boxes.xywh[best_idx].cpu().numpy()
-            conf = confs[best_idx]
+            
+            best_idx = -1
+            
+            if last_center is None:
+                # Захват цели на первом успешном кадре: берем самую уверенную детекцию
+                best_idx = confs.argmax()
+            else:
+                # Цель уже была, ищем ближайшую рамку к прошлой позиции
+                min_dist = float('inf')
+                for i, box in enumerate(boxes):
+                    x1, y1, x2, y2 = box
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    
+                    dist = np.hypot(cx - last_center[0], cy - last_center[1])
+                    
+                    if dist < min_dist and dist < MAX_PIXEL_JUMP:
+                        min_dist = dist
+                        best_idx = i
 
-            x1, y1 = int(x - w / 2), int(y - h / 2)
-            x2, y2 = int(x + w / 2), int(y + h / 2)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ball {conf:.2f}", (x1, max(y1 - 10, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            if best_idx != -1:
+                frames_lost = 0  # Сбрасываем счетчик потерь
+                
+                x1, y1, x2, y2 = boxes[best_idx].astype(int)
+                conf = confs[best_idx]
+                center_x = (x1 + x2) / 2.0
+                center_y = (y1 + y2) / 2.0
+                last_center = (center_x, center_y)
 
-            trajectory.append([current_time, float(x), float(y)])
-            found_count += 1
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"P {conf:.2f}", (x1, max(y1 - 10, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                trajectory.append([current_time, float(center_x), float(center_y)])
+                found_count += 1
+            else:
+                # В заданном радиусе нужного мяча нет
+                frames_lost += 1
+                
+                if frames_lost > MAX_LOST_FRAMES:
+                    # Ждали слишком долго — забываем старую позицию
+                    last_center = None
+                    cv2.putText(frame, "TARGET RESET. SEARCHING...", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+                else:
+                    cv2.putText(frame, "WAITING NEAR LAST POS", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         else:
+            # YOLO вообще ничего не увидел
             cv2.putText(frame, "BALL LOST", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
@@ -59,8 +108,9 @@ def main():
 
         frame_idx += 1
         current_time += frame_time
-        if frame_idx % 200 == 0:
+        if frame_idx % 100 == 0:
             print(f"  обработано кадров: {frame_idx}")
+
 
     cap.release()
     writer.release()
@@ -72,7 +122,6 @@ def main():
           f"({100 * found_count / max(frame_idx, 1):.1f}%).")
     print(f"Видео с рамками сохранено: {OUTPUT_VIDEO}")
     print(f"Координаты (t, u, v) сохранены: {OUTPUT_TRAJECTORY}")
-
 
 if __name__ == "__main__":
     main()

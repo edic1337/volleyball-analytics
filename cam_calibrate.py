@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 from scipy.optimize import minimize_scalar
 
-VIDEO_PATH = "YOLO_result.mp4"       
-FRAME_NUMBER = 767                 
+VIDEO_PATH = "trimmed_clip_short_2.mp4"       
+FRAME_NUMBER = 100                 
 OUTPUT_FILE = "camera_calib_opti.npz" 
 fx, fy = 3000.0, 3000.0
 cx, cy = 960.0, 540.0
