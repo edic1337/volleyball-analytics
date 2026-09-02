@@ -3,13 +3,14 @@ import numpy as np
 from ultralytics import YOLO
 
 
-VIDEO_PATH = "trimmed_clip_short_2.mp4"
+VIDEO_PATH = "trimmed_clip_short.mp4"
 YOLO_WEIGHTS = "runs/detect/train-18/weights/best.pt"
-CONF_THRESHOLD = 0.20
+#YOLO_WEIGHTS = "yolo11s.pt"  # аххаах она просто все видео типа отслеживала 
+CONF_THRESHOLD = 0.26
 IOU_THRESHOLD = 0.45
 IMG_SIZE = 1280 
-OUTPUT_VIDEO = "tracked_output_2.mp4"
-OUTPUT_TRAJECTORY = "ball_trajectory_2.npy"
+OUTPUT_VIDEO = "tracked_output_1.mp4"
+OUTPUT_TRAJECTORY = "ball_trajectory_1.npy"
 
 def main():
     model = YOLO(YOLO_WEIGHTS)
@@ -31,9 +32,9 @@ def main():
     found_count = 0
     
     last_center = None
-    MAX_PIXEL_JUMP = 170.0  # Максимальное смещение центра мяча за 1 кадр
+    MAX_PIXEL_JUMP = 90.0  # Максимальное смещение центра мяча за 1 кадр
     frames_lost = 0
-    MAX_LOST_FRAMES = 10
+    MAX_LOST_FRAMES = 12
 
     while True:
         ret, frame = cap.read()
@@ -73,10 +74,12 @@ def main():
                         best_idx = i
 
             if best_idx != -1:
-                frames_lost = 0  # Сбрасываем счетчик потерь
-                
                 x1, y1, x2, y2 = boxes[best_idx].astype(int)
                 conf = confs[best_idx]
+                w = x2 - x1
+                h = y2 - y1
+                box_size = min(w, h)
+                
                 center_x = (x1 + x2) / 2.0
                 center_y = (y1 + y2) / 2.0
                 last_center = (center_x, center_y)
@@ -85,7 +88,7 @@ def main():
                 cv2.putText(frame, f"P {conf:.2f}", (x1, max(y1 - 10, 0)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
-                trajectory.append([current_time, float(center_x), float(center_y)])
+                trajectory.append([current_time, float(center_x), float(center_y), float(box_size)])
                 found_count += 1
             else:
                 # В заданном радиусе нужного мяча нет

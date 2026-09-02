@@ -19,7 +19,7 @@ Extended Kalman Filter для трекинга волейбольного мяч
     последних двух подтверждённых 3D-положений и раздуваем P на скорость
 
 """
-
+from scipy.optimize import least_squares
 import numpy as np
 
 #константы
@@ -118,7 +118,7 @@ class BallEKF:
     def __init__(self, K, R, T, dt,
                  pos_std0=1.0, vel_std0=5.0,
                  process_accel_std=6.0,
-                 meas_px_std=3.0, meas_depth_std=1.5,
+                 meas_px_std=3.0, meas_depth_std=4.0,
                  gate_chi2=16.27):  # 99.9% для 2 степеней свободы (только u,v)
         self.K, self.R, self.T = K, R, T
         self.dt = dt
@@ -245,3 +245,88 @@ class BallEKF:
             updated=uv is not None, hit=hit, nis=nis,
         ))
         return self.x.copy()
+
+  
+def integrate_trajectory(state0, times):
+    states = [state0]
+    curr_state = state0.copy()
+    curr_t = 0
+    for t in times[1:]:
+        dt = t - curr_t
+        curr_state = rk4_step(curr_state, dt)
+        states.append(curr_state)
+        curr_t = t
+    return states
+ 
+ 
+def init_state_least_squares_v2(traj_window, K, R, T, lambda_box=0.05, meas_px_std=3.0,
+                                 depth_seeds=None):
+    """Batch МНК с полностью свободной позицией (3 DOF), несколько стартовых
+    точек по глубине вдоль луча первого кадра — только как seed, не constraint.
+    """
+    traj = np.array(traj_window)
+    t0 = traj[0, 0]
+    times = traj[:, 0] - t0
+    uv_meas = traj[:, 1:3]
+    box_meas = traj[:, 3]
+    f_eff = 0.5 * (K[0, 0] + K[1, 1])
+ 
+    if depth_seeds is None:
+        depth_seeds = np.linspace(6.0, 40.0, 12)  # подстройте диапазон под размер вашей площадки/дальность камеры
+ 
+    def residuals(params):
+        state0 = params.copy()
+        states = integrate_trajectory(state0, times)
+        res = []
+        for i, st in enumerate(states):
+            (pred_u, pred_v), z_cam = project(st, K, R, T)
+            res.append((pred_u - uv_meas[i, 0]) / meas_px_std)
+            res.append((pred_v - uv_meas[i, 1]) / meas_px_std)
+            if box_meas[i] > 1e-3:
+                z_box = f_eff * (2 * RADIUS) / box_meas[i]
+                res.append((z_cam - z_box) * lambda_box)
+        return res
+ 
+    u0, v0 = uv_meas[0]
+    best_res, best_loss = None, float("inf")
+    for depth_seed in depth_seeds:
+        pos0_seed = triangulate_from_depth((u0, v0), depth_seed, K, R, T)
+        idx1 = min(3, len(uv_meas) - 1)
+        pos1_seed = triangulate_from_depth(tuple(uv_meas[idx1]), depth_seed, K, R, T)
+        vel0_seed = (pos1_seed - pos0_seed) / max(times[idx1], 1e-2)
+        x0 = np.hstack([pos0_seed, vel0_seed])
+ 
+        opt_res = least_squares(residuals, x0, loss="huber", f_scale=3.0, max_nfev=3000)
+        loss = float(np.sum(np.array(opt_res.fun) ** 2))
+        if loss < best_loss:
+            best_loss, best_res = loss, opt_res
+ 
+    return best_res.x
+ 
+ 
+def init_state_robust(traj_window, K, R, T, lambda_box=0.05, meas_px_std=3.0,
+                       trim_fraction=0.15, min_points_after_trim=8):
+    """init_state_least_squares_v2 + один проход trimmed-refit.
+ 
+    Используйте эту функцию как замену вашей init_state_least_squares —
+    сигнатура (traj_window, K, R, T) совместима, дополнительные параметры
+    опциональны.
+    """
+    traj = np.array(traj_window)
+    state0 = init_state_least_squares_v2(traj.tolist(), K, R, T, lambda_box, meas_px_std)
+ 
+    times = traj[:, 0] - traj[0, 0]
+    states = integrate_trajectory(state0, times)
+    px_errs = np.array([
+        np.hypot(*(project(st, K, R, T)[0] - traj[i, 1:3]))
+        for i, st in enumerate(states)
+    ])
+ 
+    n_drop = int(len(traj) * trim_fraction)
+    if n_drop == 0 or len(traj) - n_drop < min_points_after_trim:
+        return state0  # обрезать нечего или некуда
+ 
+    keep_idx = np.sort(np.argsort(px_errs)[: len(traj) - n_drop])
+    traj_trimmed = traj[keep_idx]
+ 
+    return init_state_least_squares_v2(traj_trimmed.tolist(), K, R, T, lambda_box, meas_px_std)
