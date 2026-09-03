@@ -117,9 +117,9 @@ def _h(state, K, R, T, use_depth):
 class BallEKF:
     def __init__(self, K, R, T, dt,
                  pos_std0=1.0, vel_std0=5.0,
-                 process_accel_std=6.0,
+                 process_accel_std=1.0,
                  meas_px_std=3.0, meas_depth_std=4.0,
-                 gate_chi2=16.27):  # 99.9% для 2 степеней свободы (только u,v)
+                 gate_chi2=13.816):  # 99.9% для 2 степеней свободы (только u,v)
         self.K, self.R, self.T = K, R, T
         self.dt = dt
         self.x = None
@@ -208,7 +208,9 @@ class BallEKF:
             S = H @ self.P @ H.T + Rmat
             Kgain = self.P @ H.T @ np.linalg.inv(S)
             self.x = self.x + Kgain @ y
-            self.P = (np.eye(STATE_DIM) - Kgain @ H) @ self.P
+            I_KH = np.eye(STATE_DIM) - Kgain @ H
+            self.P = I_KH @ self.P @ I_KH.T + Kgain @ Rmat @ Kgain.T
+            self.P = (self.P + self.P.T) / 2.0
 
             v_after = self.x[3:].copy()
             self.events.append(dict(
@@ -220,7 +222,9 @@ class BallEKF:
         else:
             Kgain = self.P @ H.T @ np.linalg.inv(S)
             self.x = self.x + Kgain @ y
-            self.P = (np.eye(STATE_DIM) - Kgain @ H) @ self.P
+            I_KH = np.eye(STATE_DIM) - Kgain @ H
+            self.P = I_KH @ self.P @ I_KH.T + Kgain @ Rmat @ Kgain.T
+            self.P = (self.P + self.P.T) / 2.0
 
         self._last_confirmed.append((t, self.x[:3].copy()))
         if len(self._last_confirmed) > 5:

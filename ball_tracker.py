@@ -103,7 +103,14 @@ def main():
                     cv2.putText(frame, "WAITING NEAR LAST POS", (50, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         else:
-            # YOLO вообще ничего не увидел
+            # YOLO вообще ничего не увидел — это тоже потеря цели, а не
+            # отдельный случай. Раньше frames_lost здесь не увеличивался,
+            # и таймаут MAX_LOST_FRAMES никогда не срабатывал при полном
+            # пропадании мяча (самый частый случай: улетел за кадр, закрыт
+            # игроком, смазан до неузнаваемости).
+            frames_lost += 1
+            if frames_lost > MAX_LOST_FRAMES:
+                last_center = None
             cv2.putText(frame, "BALL LOST", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
