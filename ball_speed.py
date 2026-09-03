@@ -117,7 +117,7 @@ def _h(state, K, R, T, use_depth):
 class BallEKF:
     def __init__(self, K, R, T, dt,
                  pos_std0=1.0, vel_std0=5.0,
-                 process_accel_std=1.0,
+                 process_accel_std=3.0,
                  meas_px_std=3.0, meas_depth_std=4.0,
                  gate_chi2=13.816):  # 99.9% для 2 степеней свободы (только u,v)
         self.K, self.R, self.T = K, R, T
@@ -263,11 +263,12 @@ def integrate_trajectory(state0, times):
     return states
  
  
-def init_state_least_squares_v2(traj_window, K, R, T, lambda_box=0.05, meas_px_std=3.0,
+def init_state_least_squares_v2(traj_window, K, R, T, meas_px_std=3.0, meas_depth_std=4.0,
                                  depth_seeds=None):
     """Batch МНК с полностью свободной позицией (3 DOF), несколько стартовых
     точек по глубине вдоль луча первого кадра — только как seed, не constraint.
     """
+    lambda_box = 1.0 / meas_depth_std
     traj = np.array(traj_window)
     t0 = traj[0, 0]
     times = traj[:, 0] - t0

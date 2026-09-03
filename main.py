@@ -48,7 +48,7 @@ from ball_speed import (
     rk4_step, jacobian_f, init_state_robust,
 )
 
-VIDEO_PATH = "trimmed_clip.mp4"
+VIDEO_PATH = "video.mp4"
 YOLO_WEIGHTS = "runs/detect/train-18/weights/best.pt"
 CALIB_PATH = "camera_calib_opti.npz"
 OUTPUT_VIDEO = "final_speed_ekf.mp4"
@@ -58,9 +58,9 @@ IOU_THRESHOLD = 0.45
 IMG_SIZE = 1280
 N_INIT_POINTS = 15               # точек для батч-МНК инициализации EKF (нужна оценка глубины по боксу)
 INIT_BOOTSTRAP_GATE_PX = 120.0   # грубый гейт на этапе bootstrap, пока EKF ещё не запущен
-GATE_CHI2 = 9.21                 # 99% для 2 ст.св. — гейт кандидатов YOLO по (u,v) предсказанию
+GATE_CHI2 = 35                 # 99% для 2 ст.св. — гейт кандидатов YOLO по (u,v) предсказанию
 MEAS_PX_STD = 3.0
-MEAS_DEPTH_STD = 4.0
+MEAS_DEPTH_STD = 7.0
 
 
 def load_calib(path):
@@ -100,6 +100,83 @@ def pick_bootstrap_candidate(cands, last_center):
         if d < best_dist and d < INIT_BOOTSTRAP_GATE_PX:
             best_dist, best = d, c
     return best
+
+def collect_bootstrap_candidates(cap, model, dt_nominal, t_start=0.0, n_candidates=80):
+    """Копим кадры-кандидаты для ручного выбора. Ничего не решаем автоматически —
+    просто собираем буфер (t, frame, chosen)."""
+    frames_buf = []
+    last_center = None
+    t = t_start
+    while len(frames_buf) < n_candidates:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cands = yolo_detect(model, frame)
+        chosen = pick_bootstrap_candidate(cands, last_center)
+        if chosen is not None:
+            last_center = (chosen[0], chosen[1])
+        frames_buf.append((t, frame.copy(), chosen))
+        t += dt_nominal
+    return frames_buf
+
+
+def select_clean_window_manual(frames_buf):
+    """
+    Управление:
+      d / стрелка вправо — следующий кадр
+      a / стрелка влево  — предыдущий кадр
+      s — отметить START (начало чистого полёта, сразу после броска/подачи)
+      e — отметить END (конец окна, до касания рук/пола/сетки)
+      Enter — подтвердить
+      Esc — отмена (наберём ещё кадров и попробуем снова)
+    """
+    idx, start_idx, end_idx = 0, None, None
+    n = len(frames_buf)
+
+    def render(i):
+        t, frame, chosen = frames_buf[i]
+        disp = frame.copy()
+        if chosen is not None:
+            cx, cy, box_size, conf, (x1, y1, x2, y2) = chosen
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(disp, f"box={box_size:.1f} conf={conf:.2f}",
+                        (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        else:
+            cv2.putText(disp, "NO DETECTION", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        status = f"frame {i}/{n-1}  t={t:.3f}s  START={start_idx}  END={end_idx}"
+        cv2.putText(disp, status, (30, disp.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(disp, "d/a след/пред | s старт | e конец | Enter ок | Esc отмена",
+                    (30, disp.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
+        cv2.imshow("Select clean flight window", disp)
+
+    cv2.namedWindow("Select clean flight window")
+    render(idx)
+    while True:
+        key = cv2.waitKey(0) & 0xFF
+        if key == ord('d'):
+            idx = min(idx + 1, n - 1)
+        elif key == ord('a'):
+            idx = max(idx - 1, 0)
+        elif key == ord('s'):
+            start_idx = idx
+        elif key == ord('e'):
+            end_idx = idx
+        elif key == 13:  # Enter
+            if start_idx is not None and end_idx is not None and end_idx > start_idx:
+                break
+            print("Отметь и START, и END (END должен быть после START)")
+        elif key == 27:  # Esc
+            cv2.destroyWindow("Select clean flight window")
+            return None
+        render(idx)
+
+    cv2.destroyWindow("Select clean flight window")
+    window = frames_buf[start_idx:end_idx + 1]
+    rows = [[t, c[0], c[1], c[2]] for t, _, c in window if c is not None and c[2] > 1e-3]
+    print(f"Окно [{start_idx}:{end_idx}], точек с валидным боксом: {len(rows)}")
+    if len(rows) < 8:
+        print("ВНИМАНИЕ: мало точек с боксом в окне — инициализация может быть неустойчивой")
+    return rows
 
 
 def predict_peek(ekf, dt):
@@ -183,40 +260,38 @@ def main():
     frame_idx = 0
     ekf = None
 
-    while ekf is None:
-        ret, frame = cap.read()
-        if not ret:
-            raise RuntimeError(
-                f"Видео закончилось, не набрав {N_INIT_POINTS} точек для "
-                "инициализации EKF — мяч ни разу уверенно не задетектирован."
-            )
-        cands = yolo_detect(model, frame)
-        chosen = pick_bootstrap_candidate(cands, last_center)
-        bootstrap_frames.append((t, frame.copy(), chosen))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    dt_nominal = 1.0 / fps
 
-        if chosen is not None:
-            cx, cy, box_size, conf, _ = chosen
-            last_center = (cx, cy)
-            if box_size > 1e-3:
-                bootstrap_rows.append([t, cx, cy, box_size])
+    frames_buf = collect_bootstrap_candidates(cap, model, dt_nominal, n_candidates=80)
 
-        t += dt_nominal
-        frame_idx += 1
+    clean_rows = None
+    while clean_rows is None:
+        clean_rows = select_clean_window_manual(frames_buf)
+        if clean_rows is None:
+            extra = collect_bootstrap_candidates(cap, model, dt_nominal,
+                                              t_start=frames_buf[-1][0] + dt_nominal, n_candidates=40)
+            frames_buf += extra
 
-        if len(bootstrap_rows) >= N_INIT_POINTS:
-            state0 = init_state_robust(bootstrap_rows, K, R, T)
-            ekf = BallEKF(K, R, T, dt=dt_nominal,
-                          process_accel_std=1.0,
-                           meas_px_std=MEAS_PX_STD, meas_depth_std=MEAS_DEPTH_STD)
-            t0 = bootstrap_rows[0][0]
-            ekf.init_state(t0, state0[:3], state0[3:])
-            print(f"EKF инициализирован по {len(bootstrap_rows)} точкам: "
-                  f"pos0={state0[:3].round(2)}  v0={state0[3:].round(2)} м/с "
-                  f"(|v0|={np.linalg.norm(state0[3:]) * 3.6:.1f} км/ч)")
+    state0 = init_state_robust(clean_rows, K, R, T, lambda_box=0.2)
+    ekf = BallEKF(K, R, T, dt=dt_nominal, process_accel_std=3.0,
+              meas_px_std=MEAS_PX_STD, meas_depth_std=MEAS_DEPTH_STD)
+    t0 = clean_rows[0][0]
+    ekf.init_state(t0, state0[:3], state0[3:])
+    print(f"EKF инициализирован: pos0={state0[:3].round(2)}  v0={state0[3:].round(2)} м/с "
+        f"(|v0|={np.linalg.norm(state0[3:]) * 3.6:.1f} км/ч)")
 
-    # "довести" фильтр по уже просмотренным bootstrap-кадрам обычным шагом,
-    # чтобы Фаза 2 продолжала с тем же непрерывным состоянием
-    for ft, frame, chosen in bootstrap_frames:
+    MAX_REALISTIC_SPEED = 45.0
+    if np.linalg.norm(state0[3:]) > MAX_REALISTIC_SPEED:
+        print("ВНИМАНИЕ: |v0| всё ещё нефизична даже после ручного выбора — "
+            "проверь порядок кликов калибровки или сам выбор окна")
+
+    # довести фильтр по всем буферизованным кадрам начиная со START окна —
+    # кадры ДО start_idx просто пропускаем, EKF тогда ещё не существовал
+    start_t = clean_rows[0][0]
+    for ft, frame, chosen in frames_buf:
+        if ft < start_t:
+            continue
         cx = cy = box_size = conf = None
         uv = None
         if chosen is not None:
@@ -226,11 +301,14 @@ def main():
         speed = float(np.linalg.norm(x[3:]))
         hit = ekf.history[-1]["hit"]
         log_rows.append([ft, cx if uv else np.nan, cy if uv else np.nan,
-                          box_size if box_size else np.nan,
-                          conf if conf is not None else np.nan,
-                          uv is not None, hit, speed])
+                        box_size if box_size else np.nan,
+                        conf if conf is not None else np.nan,
+                        uv is not None, hit, speed])
         draw_frame(frame, chosen, x, speed, K, R, T, hit)
         writer.write(frame)
+
+    t = frames_buf[-1][0] + dt_nominal
+    frame_idx = len(frames_buf)
 
     frames_lost = 0
     while True:
@@ -238,20 +316,24 @@ def main():
         if not ret:
             break
         cands = yolo_detect(model, frame)
-
         dt = t - ekf._t_prev
         x_pred, P_pred = predict_peek(ekf, max(dt, 1e-6))
-        chosen, nis = gate_and_pick(cands, x_pred, P_pred, K, R, T)
+
+        # Аварийный сброс и гейтинг
+        if frames_lost > 12 and len(cands) > 0:
+            chosen = max(cands, key=lambda c: c[3])
+            nis = 100.0  
+        else:
+            chosen, nis = gate_and_pick(cands, x_pred, P_pred, K, R, T)
 
         cx = cy = box_size = conf = None
         uv = None
         if chosen is not None:
             cx, cy, box_size, conf, _ = chosen
             uv = (cx, cy)
-            frames_lost = 0
+            frames_lost = 0   # Сброс счетчика при детекции
         else:
-            frames_lost += 1
-
+            frames_lost += 1  # Увеличение счетчика при потере
         x = ekf.step(t, uv, box_size, conf if conf is not None else 1.0)
         speed = float(np.linalg.norm(x[3:]))
         hit = ekf.history[-1]["hit"]
