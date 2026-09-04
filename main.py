@@ -60,7 +60,8 @@ N_INIT_POINTS = 15               # точек для батч-МНК иници�
 INIT_BOOTSTRAP_GATE_PX = 120.0   # грубый гейт на этапе bootstrap, пока EKF ещё не запущен
 GATE_CHI2 = 35                 # 99% для 2 ст.св. — гейт кандидатов YOLO по (u,v) предсказанию
 MEAS_PX_STD = 3.0
-MEAS_DEPTH_STD = 7.0
+MEAS_DEPTH_STD = 4.0
+MISS_INFLATE_PX2 = 250.0
 
 
 def load_calib(path):
@@ -190,7 +191,7 @@ def predict_peek(ekf, dt):
     return x_pred, P_pred
 
 
-def gate_and_pick(cands, x_pred, P_pred, K, R, T):
+def gate_and_pick(cands, x_pred, P_pred, K, R, T, frames_lost=0):
     """Гейтинг кандидатов YOLO по Махаланобис-дистанции к physика-
     предсказанию (вместо фиксированного пиксельного радиуса). Среди
     прошедших гейт выбирается лучший с учётом conf."""
@@ -201,6 +202,13 @@ def gate_and_pick(cands, x_pred, P_pred, K, R, T):
     H = measurement_jacobian(x_pred, K, R, T, use_depth=False)
     Rmat = np.eye(2) * MEAS_PX_STD ** 2
     S = H @ P_pred @ H.T + Rmat
+    # За время потери трек мог свернуть не так, как предсказывает линейная
+    # Q (удар/отскок — нелинейное событие). Расширяем ТОЛЬКО зону поиска
+    # кандидата, а не реальную P фильтра — иначе следующий update() унаследует
+    # раздутую P и дольше будет "отходить" даже после нормальной поимки.
+    if frames_lost > 0:
+        S = S + np.eye(2) * MISS_INFLATE_PX2 * frames_lost
+
     S_inv = np.linalg.inv(S)
 
     best, best_score, best_nis = None, float("inf"), None
@@ -209,7 +217,7 @@ def gate_and_pick(cands, x_pred, P_pred, K, R, T):
         nis = float(y @ S_inv @ y)
         if nis > GATE_CHI2:
             continue
-        score = nis / max(c[3], 0.05)  # штраф за низкий conf
+        score = nis / max(c[3], 0.05)
         if score < best_score:
             best_score, best, best_nis = score, c, nis
     return best, best_nis
@@ -275,7 +283,8 @@ def main():
 
     state0 = init_state_robust(clean_rows, K, R, T, lambda_box=0.2)
     ekf = BallEKF(K, R, T, dt=dt_nominal, process_accel_std=3.0,
-              meas_px_std=MEAS_PX_STD, meas_depth_std=MEAS_DEPTH_STD)
+              meas_px_std=MEAS_PX_STD, meas_depth_std=MEAS_DEPTH_STD,
+              gate_chi2=GATE_CHI2)
     t0 = clean_rows[0][0]
     ekf.init_state(t0, state0[:3], state0[3:])
     print(f"EKF инициализирован: pos0={state0[:3].round(2)}  v0={state0[3:].round(2)} м/с "
@@ -319,21 +328,16 @@ def main():
         dt = t - ekf._t_prev
         x_pred, P_pred = predict_peek(ekf, max(dt, 1e-6))
 
-        # Аварийный сброс и гейтинг
-        if frames_lost > 12 and len(cands) > 0:
-            chosen = max(cands, key=lambda c: c[3])
-            nis = 100.0  
-        else:
-            chosen, nis = gate_and_pick(cands, x_pred, P_pred, K, R, T)
+        chosen, nis = gate_and_pick(cands, x_pred, P_pred, K, R, T, frames_lost)
 
         cx = cy = box_size = conf = None
         uv = None
         if chosen is not None:
             cx, cy, box_size, conf, _ = chosen
             uv = (cx, cy)
-            frames_lost = 0   # Сброс счетчика при детекции
+            frames_lost = 0
         else:
-            frames_lost += 1  # Увеличение счетчика при потере
+            frames_lost += 1
         x = ekf.step(t, uv, box_size, conf if conf is not None else 1.0)
         speed = float(np.linalg.norm(x[3:]))
         hit = ekf.history[-1]["hit"]

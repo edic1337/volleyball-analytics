@@ -192,27 +192,27 @@ class BallEKF:
 
         hit_detected = False
         if nis > self.gate_chi2 and len(self._last_confirmed) >= 1:
-            # Похоже на удар/контакт: физика между предыдущей подтверждённой
-            # точкой и этой сломалась. Переинициализируем скорость по конечной
-            # разности вместо доверия физическому предсказанию
             hit_detected = True
             t_prev, pos_prev = self._last_confirmed[-1]
-            # Грубая 3D-оценка текущей точки: используем physика-предсказанную
-            # глубину как приближение, обновлять будем ниже обычным шагом EKF,
-            # но с сильно раздутой P на скорость, чтобы измерение "перетянуло" её
             dt_meas = max(t - t_prev, 1e-3)
             v_before = self.x[3:].copy()
-            self.P[3:, 3:] *= 400.0  # временно "не доверяем" физике по скорости
 
-            # пересчитываем инновацию/усиление с раздутой P
-            S = H @ self.P @ H.T + Rmat
-            Kgain = self.P @ H.T @ np.linalg.inv(S)
-            self.x = self.x + Kgain @ y
-            I_KH = np.eye(STATE_DIM) - Kgain @ H
-            self.P = I_KH @ self.P @ I_KH.T + Kgain @ Rmat @ Kgain.T
-            self.P = (self.P + self.P.T) / 2.0
+            # Берем глубину из физического предсказания, чтобы не гадать по рамке
+            _, z_cam_pred = project(self.x, self.K, self.R, self.T)
+            
+            # Вычисляем точные 3D-координаты мяча 
+            pos_new = triangulate_from_depth(uv, z_cam_pred, self.K, self.R, self.T)
 
-            v_after = self.x[3:].copy()
+            # Считаем скорость по честной конечной разности
+            v_after = (pos_new - pos_prev) / dt_meas
+
+            # Жестко перезаписываем состояние (без взрыва матрицы)
+            self.x[:3] = pos_new
+            self.x[3:] = v_after
+            
+            # Сбрасываем неопределенность до базовой, так как мы только что "увидели" мяч
+            self.P = np.diag([self.pos_std0**2]*3 + [self.vel_std0**2]*3)
+
             self.events.append(dict(
                 t=t, pos=self.x[:3].copy(),
                 v_before=v_before, v_after=v_after,
@@ -318,7 +318,11 @@ def init_state_robust(traj_window, K, R, T, lambda_box=0.05, meas_px_std=3.0,
     опциональны.
     """
     traj = np.array(traj_window)
-    state0 = init_state_least_squares_v2(traj.tolist(), K, R, T, lambda_box, meas_px_std)
+    meas_depth_std = 1.0 / lambda_box
+    state0 = init_state_least_squares_v2(
+        traj.tolist(), K, R, T,
+        meas_px_std=meas_px_std, meas_depth_std=meas_depth_std,
+    )
  
     times = traj[:, 0] - traj[0, 0]
     states = integrate_trajectory(state0, times)
@@ -334,4 +338,7 @@ def init_state_robust(traj_window, K, R, T, lambda_box=0.05, meas_px_std=3.0,
     keep_idx = np.sort(np.argsort(px_errs)[: len(traj) - n_drop])
     traj_trimmed = traj[keep_idx]
  
-    return init_state_least_squares_v2(traj_trimmed.tolist(), K, R, T, lambda_box, meas_px_std)
+    return init_state_least_squares_v2(
+        traj_trimmed.tolist(), K, R, T,
+        meas_px_std=meas_px_std, meas_depth_std=meas_depth_std,
+    )
