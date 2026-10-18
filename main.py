@@ -1,56 +1,31 @@
 """
-main.py — совместная работа YOLO-детектора и физической EKF-модели полёта
-мяча для непрерывного точного определения скорости.
-  1. YOLO на каждом кадре может дать несколько кандидатов (мяч, похожие
-     объекты, шум). Раньше нужный кандидат выбирался по фиксированному
-     пиксельному радиусу от last_center (ball_tracker.py, MAX_PIXEL_JUMP) —
-     это ломалось, если last_center "залипал" на N кадров потери детекции,
-     а мяч успевал улететь дальше 90px.
-     Здесь вместо этого на каждом кадре сначала делается PREDICT-шаг EKF
-     (физика: RK4 по гравитации + сопротивлению воздуха) без коммита в
-     состояние фильтра — только чтобы получить предсказанную позицию (u,v)
-     и её ковариацию S = H P H^T + R. Кандидаты YOLO гейтятся по
-     Махаланобис-дистанции к этому предсказанию (chi2-тест), а среди
-     прошедших гейт выбирается лучший с учётом confidence YOLO. Гейт
-     "дышит" вместе с фильтром: после нескольких кадров без детекций P
-     растёт (через Q в predict), и радиус поиска сам расширяется —
-     не нужно вручную растягивать константу.
-  2. Если ни один кандидат не прошёл гейт (окклюзия, мяч за кадром,
-     смазан) — детекции в этом кадре просто нет. Состояние фильтра всё
-     равно обновляется физикой. Скорость не теряется и не зависает на время потери.
-  3. Удары (руки/пол/сетка) ловятся не пост-хок сегментацией по времени,
-     а онлайн — через NIS-гейтинг внутри BallEKF.update на каждом
-     реальном обновлении.
-  4. conf YOLO используется дважды: как вес при выборе кандидата среди
-     нескольких, прошедших гейт, и как масштаб R (шума измерения) внутри
-     самого EKF-апдейта (meas_conf).
-  5. Скорость на каждый кадр = ||v|| из состояния EKF — непрерывный ряд,
-     без разрывов на границах "сегментов".
+main.py — Четырехпроходный физический пайплайн поверх детекций YOLO:
+  Проход 1: Look-Ahead 2D-трекинг (захват вбросов с conf >= 0.24 по 3-кадровой коллинеарности).
+  Проход 2: Гравитационная фильтрация фаз 'мяч в руках игрока' (0.0 км/ч) и первичная 3D-сборка.
+  Проход 3: Обратная проекция 3D-физики на кэш YOLO и уточнение кадров удара.
+  Проход 4: Финальная 3D-реконструкция с 6D Bundle Adjustment.
 """
-
+import os
+import pickle
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 from ball_speed import (
-    BallEKF, project, measurement_jacobian, _h,
-    rk4_step, jacobian_f, init_state_robust,
+    RADIUS, project, triangulate_from_depth, ray_court_depth_bounds,
+    court_depth_stats, calibrate_box_scale, solve_connected_rally_arcs,
 )
 
-VIDEO_PATH = "video.mp4"
-YOLO_WEIGHTS = "runs/detect/train-18/weights/best.pt"
+VIDEO_PATH = "trimmed_clip.mp4"
+YOLO_WEIGHTS = "runs/detect/train-18/weights/best_openvino_model/"
 CALIB_PATH = "camera_calib_opti.npz"
-OUTPUT_VIDEO = "final_speed_ekf.mp4"
-OUTPUT_TRAJECTORY = "ball_trajectory_ekf.npy"
-CONF_THRESHOLD = 0.26
+OUTPUT_VIDEO = "trimmed_clip_ekf_long.mp4"
+OUTPUT_TRAJECTORY = "ball_trajectory_trimmed_clip_ekf_long.npy"
+
+CONF_THRESHOLD = 0.22
 IOU_THRESHOLD = 0.45
 IMG_SIZE = 1280
-N_INIT_POINTS = 15               # точек для батч-МНК инициализации EKF (нужна оценка глубины по боксу)
-INIT_BOOTSTRAP_GATE_PX = 120.0   # грубый гейт на этапе bootstrap, пока EKF ещё не запущен
-GATE_CHI2 = 35                 # 99% для 2 ст.св. — гейт кандидатов YOLO по (u,v) предсказанию
-MEAS_PX_STD = 3.0
-MEAS_DEPTH_STD = 4.0
-MISS_INFLATE_PX2 = 250.0
+SHOW_LIVE_PREVIEW = True
 
 
 def load_calib(path):
@@ -58,175 +33,577 @@ def load_calib(path):
     return calib["K"], calib["R"], calib["T"]
 
 
-def yolo_detect(model, frame):
-    """Возвращает список кандидатов (cx, cy, box_size, conf, bbox)."""
-    results = model.predict(
-        frame, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
-        imgsz=IMG_SIZE, verbose=False,
-    )[0]
-    cands = []
-    if results.boxes is not None and len(results.boxes) > 0:
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        for (x1, y1, x2, y2), c in zip(boxes, confs):
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            box_size = min(x2 - x1, y2 - y1)
-            cands.append((cx, cy, box_size, float(c),
-                          (int(x1), int(y1), int(x2), int(y2))))
-    return cands
+def extract_or_load_yolo_detections(video_path, model_path):
+    cache_path = f"{video_path}.yolo_cache.pkl"
+    if os.path.exists(cache_path):
+        print(f"Загружаю кэш детекций YOLO из {cache_path}...")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
 
+    print("Первичный прогон YOLO по видео (результат будет сохранен в кэш)...")
+    model = YOLO(model_path)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Не удалось открыть видео: {video_path}")
 
-def pick_bootstrap_candidate(cands, last_center):
-    """До инициализации EKF гейтить нечем — выбираем так: по близости к последней принятой точке, либо
-    по максимальному conf на самом первом успешном кадре."""
-    if not cands:
-        return None
-    if last_center is None:
-        return max(cands, key=lambda c: c[3])
-    best, best_dist = None, float("inf")
-    for c in cands:
-        d = np.hypot(c[0] - last_center[0], c[1] - last_center[1])
-        if d < best_dist and d < INIT_BOOTSTRAP_GATE_PX:
-            best_dist, best = d, c
-    return best
-
-def collect_bootstrap_candidates(cap, model, dt_nominal, t_start=0.0, n_candidates=80):
-    """Копим кадры-кандидаты для ручного выбора. Ничего не решаем автоматически —
-    просто собираем буфер (t, frame, chosen)."""
-    frames_buf = []
-    last_center = None
-    t = t_start
-    while len(frames_buf) < n_candidates:
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    all_cands = []
+    idx = 0
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-        cands = yolo_detect(model, frame)
-        chosen = pick_bootstrap_candidate(cands, last_center)
-        if chosen is not None:
-            last_center = (chosen[0], chosen[1])
-        frames_buf.append((t, frame.copy(), chosen))
-        t += dt_nominal
-    return frames_buf
+        res = model.predict(
+            frame, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
+            imgsz=IMG_SIZE, verbose=False
+        )[0]
+        cands = []
+        if res.boxes is not None and len(res.boxes) > 0:
+            boxes = res.boxes.xyxy.cpu().numpy()
+            confs = res.boxes.conf.cpu().numpy()
+            for (x1, y1, x2, y2), c in zip(boxes, confs):
+                cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+                bsize = min(x2 - x1, y2 - y1)
+                cands.append((
+                    float(cx), float(cy), float(bsize), float(c),
+                    (int(x1), int(y1), int(x2), int(y2))
+                ))
+        all_cands.append(cands)
+        idx += 1
+        if idx % 200 == 0:
+            print(f"  YOLO обработал кадров: {idx}")
+
+    cap.release()
+    data = dict(fps=fps, all_cands=all_cands)
+    with open(cache_path, "wb") as f:
+        pickle.dump(data, f)
+    print(f"Кэш детекций сохранен: {cache_path} ({len(all_cands)} кадров)")
+    return data
 
 
-def select_clean_window_manual(frames_buf):
+def find_static_background_balls(all_cands, grid_px=14.0, min_persistence_ratio=0.04):
+    counts = {}
+    n_frames = max(len(all_cands), 1)
+    for cands in all_cands:
+        seen_cells = set()
+        for c in cands:
+            cell = (int(round(c[0] / grid_px)), int(round(c[1] / grid_px)))
+            seen_cells.add(cell)
+        for cell in seen_cells:
+            counts[cell] = counts.get(cell, 0) + 1
+
+    static_centers = []
+    for (gx, gy), cnt in counts.items():
+        if cnt > max(32, int(n_frames * min_persistence_ratio)):
+            static_centers.append((gx * grid_px, gy * grid_px))
+    return static_centers
+
+
+def is_static_false_positive(u, v, static_centers, radius=22.0):
+    for sx, sy in static_centers:
+        if np.hypot(u - sx, v - sy) < radius:
+            return True
+    return False
+
+
+def is_valid_ball_candidate(cand, K, R, T, is_tracking=False):
+    cx, cy, bsize, conf, (x1, y1, x2, y2) = cand
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    aspect = max(w, h) / float(min(w, h))
+
+    if aspect > 2.15 or (aspect > 1.75 and conf < 0.42):
+        return False
+    if bsize < 4.5 or bsize > 68.0:
+        return False
+
+    if conf < 0.45:
+        f_eff = 0.5 * (K[0, 0] + K[1, 1])
+        z_raw = f_eff * (2.0 * RADIUS) / bsize
+        z_lo, z_hi = ray_court_depth_bounds((cx, cy), K, R, T)
+        if not (z_lo * 0.45 <= z_raw <= z_hi * 1.65):
+            return False
+
+    return True
+
+
+def _has_kinematic_continuation(all_cands, frame_idx, cand, static_balls, K, R, T, require_two_steps=False):
     """
-    Управление:
-      d — следующий кадр
-      a — предыдущий кадр
-      s — отметить START (начало чистого полёта, сразу после броска/подачи)
-      e — отметить END (конец окна, до касания рук/пола/сетки)
-      Enter — подтвердить
-      Esc — отмена (наберём ещё кадров и попробуем снова)
+    Проверяет на 1-2 кадра вперед наличие плавного продолжения движения.
+    Если require_two_steps=True (при низком conf < 0.40 на вбросе мяча), требует 3 коллинеарные точки!
     """
-    idx, start_idx, end_idx = 0, None, None
-    n = len(frames_buf)
+    u0, v0, b0, _, _ = cand
+    n = len(all_cands)
 
-    def render(i):
-        t, frame, chosen = frames_buf[i]
-        disp = frame.copy()
-        if chosen is not None:
-            cx, cy, box_size, conf, (x1, y1, x2, y2) = chosen
-            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(disp, f"box={box_size:.1f} conf={conf:.2f}",
-                        (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        else:
-            cv2.putText(disp, "NO DETECTION", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        status = f"frame {i}/{n-1}  t={t:.3f}s  START={start_idx}  END={end_idx}"
-        cv2.putText(disp, status, (30, disp.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(disp, "d/a след/пред | s старт | e конец | Enter ок | Esc отмена",
-                    (30, disp.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
-        cv2.imshow("Select clean flight window", disp)
-
-    cv2.namedWindow("Select clean flight window")
-    render(idx)
-    while True:
-        key = cv2.waitKey(0) & 0xFF
-        if key == ord('d'):
-            idx = min(idx + 1, n - 1)
-        elif key == ord('a'):
-            idx = max(idx - 1, 0)
-        elif key == ord('s'):
-            start_idx = idx
-        elif key == ord('e'):
-            end_idx = idx
-        elif key == 13:  # Enter
-            if start_idx is not None and end_idx is not None and end_idx > start_idx:
-                break
-            print("Отметь и START, и END (END должен быть после START)")
-        elif key == 27:  # Esc
-            cv2.destroyWindow("Select clean flight window")
-            return None
-        render(idx)
-
-    cv2.destroyWindow("Select clean flight window")
-    window = frames_buf[start_idx:end_idx + 1]
-    rows = [[t, c[0], c[1], c[2]] for t, _, c in window if c is not None and c[2] > 1e-3]
-    print(f"Окно [{start_idx}:{end_idx}], точек с валидным боксом: {len(rows)}")
-    if len(rows) < 8:
-        print("ВНИМАНИЕ: мало точек с боксом в окне — инициализация может быть неустойчивой")
-    return rows
-
-
-def predict_peek(ekf, dt):
-    """Physic-предсказание без коммита в состояние фильтра — нужно
-    только чтобы получить гейт (позицию + ковариацию) для выбора
-    детекции в текущем кадре."""
-    F = jacobian_f(ekf.x, dt)
-    x_pred = rk4_step(ekf.x, dt)
-    Q = ekf._process_noise(dt)
-    P_pred = F @ ekf.P @ F.T + Q
-    return x_pred, P_pred
-
-
-def gate_and_pick(cands, x_pred, P_pred, K, R, T, frames_lost=0):
-    """Гейтинг кандидатов YOLO по Махаланобис-дистанции к physic-
-    предсказанию (вместо фиксированного пиксельного радиуса). Среди
-    прошедших гейт выбирается лучший с учётом conf."""
-    if not cands:
-        return None, None
-
-    h0 = _h(x_pred, K, R, T, use_depth=False)
-    H = measurement_jacobian(x_pred, K, R, T, use_depth=False)
-    Rmat = np.eye(2) * MEAS_PX_STD ** 2
-    S = H @ P_pred @ H.T + Rmat
-    # За время потери трек мог свернуть не так, как предсказывает линейная
-    # Q (удар/отскок — нелинейное событие). Расширяем только зону поиска
-    # кандидата, а не реальную P фильтра — иначе следующий update() унаследует
-    # раздутую P и дольше будет "отходить" даже после нормальной поимки
-    if frames_lost > 0:
-        S = S + np.eye(2) * MISS_INFLATE_PX2 * frames_lost
-
-    S_inv = np.linalg.inv(S)
-
-    best, best_score, best_nis = None, float("inf"), None
-    for c in cands:
-        y = np.array([c[0], c[1]]) - h0
-        nis = float(y @ S_inv @ y)
-        if nis > GATE_CHI2:
+    for step1 in (1, 2):
+        if frame_idx + step1 >= n:
             continue
-        score = nis / max(c[3], 0.05)
-        if score < best_score:
-            best_score, best, best_nis = score, c, nis
-    return best, best_nis
+        for c1 in all_cands[frame_idx + step1]:
+            if is_static_false_positive(c1[0], c1[1], static_balls):
+                continue
+            if not is_valid_ball_candidate(c1, K, R, T):
+                continue
+            du1 = c1[0] - u0
+            dv1 = c1[1] - v0
+            dist1 = np.hypot(du1, dv1)
+            if dist1 > 115.0 * step1 or abs(c1[2] - b0) > max(12.0, 0.55 * b0):
+                continue
+
+            if not require_two_steps:
+                return True
+
+            # Для слабого conf проверяем второй шаг вдоль того же вектора скорости
+            u_exp = c1[0] + du1 / step1
+            v_exp = c1[1] + dv1 / step1 + 8.0
+            if frame_idx + step1 + 1 < n:
+                for c2 in all_cands[frame_idx + step1 + 1]:
+                    if is_static_false_positive(c2[0], c2[1], static_balls):
+                        continue
+                    if np.hypot(c2[0] - u_exp, c2[1] - v_exp) < 42.0:
+                        return True
+    return False
 
 
-def draw_frame(frame, chosen, state, speed, K, R, T, hit=False, frames_lost=0):
-    (u_phys, v_phys), _ = project(state, K, R, T)
-    color_phys = (255, 0, 0) if chosen is None else (0, 200, 255)
-    cv2.circle(frame, (int(u_phys), int(v_phys)), 4, color_phys, -1)
+def _clean_2d_track_outliers(chosen_list, all_cands, static_balls, K, R, T):
+    n = len(chosen_list)
+    cleaned = list(chosen_list)
+
+    for i in range(2, n - 2):
+        if cleaned[i] is None:
+            continue
+        neigh = [(k, cleaned[k]) for k in (i - 2, i - 1, i + 1, i + 2) if cleaned[k] is not None]
+        if len(neigh) < 3:
+            continue
+
+        ks = np.array([k for k, _ in neigh], dtype=float)
+        us = np.array([c[0] for _, c in neigh], dtype=float)
+        vs = np.array([c[1] for _, c in neigh], dtype=float)
+        deg = 2 if len(neigh) == 4 else 1
+        u_interp = float(np.polyval(np.polyfit(ks - i, us, deg), 0.0))
+        v_interp = float(np.polyval(np.polyfit(ks - i, vs, deg), 0.0))
+
+        curr_u, curr_v, _, curr_conf, _ = cleaned[i]
+        err_px = np.hypot(curr_u - u_interp, curr_v - v_interp)
+
+        if err_px > 28.0 and (curr_conf < 0.55 or err_px > 48.0):
+            best_rep = None
+            best_d = 24.0
+            for c in all_cands[i]:
+                if is_static_false_positive(c[0], c[1], static_balls):
+                    continue
+                d = np.hypot(c[0] - u_interp, c[1] - v_interp)
+                if d < best_d:
+                    best_d, best_rep = d, c
+            cleaned[i] = best_rep
+
+    return cleaned
+
+
+def track_2d_video(all_cands, fps, width, height, K, R, T):
+    dt = 1.0 / fps
+    static_balls = find_static_background_balls(all_cands)
+    if static_balls:
+        print(f"Обнаружено и замаскировано неподвижных фоновых мячей: {len(static_balls)}")
+
+    n = len(all_cands)
+    chosen_list = [None] * n
+    out_of_fov_list = [False] * n
+
+    history = []
+    lost_in_fov = 0
+    above_frame_mode = False
+    above_poly_u = None
+    above_poly_v = None
+    t_exit = 0.0
+
+    for i in range(n):
+        t = i * dt
+        raw_cands = [
+            c for c in all_cands[i]
+            if not is_static_false_positive(c[0], c[1], static_balls)
+            and is_valid_ball_candidate(c, K, R, T, is_tracking=bool(history))
+        ]
+
+        if above_frame_mode:
+            dt_out = t - t_exit
+            u_pred = above_poly_u[0] + above_poly_u[1] * dt_out
+            v_pred = above_poly_v[0] + above_poly_v[1] * dt_out + above_poly_v[2] * (dt_out ** 2)
+
+            if dt_out > 1.85 or v_pred > height * 0.42:
+                above_frame_mode = False
+                history = []
+            else:
+                out_of_fov_list[i] = True
+                best, best_d = None, 190.0
+                for c in raw_cands:
+                    if c[1] < 220.0:
+                        d = np.hypot(c[0] - u_pred, c[1] - max(v_pred, 15.0))
+                        if d < best_d:
+                            best_d, best = d, c
+                if best is not None:
+                    chosen_list[i] = best
+                    out_of_fov_list[i] = False
+                    above_frame_mode = False
+                    history.append((t, best[0], best[1], best[2], best[3]))
+                    lost_in_fov = 0
+                continue
+
+        # Старт трека: разрешаем conf >= 0.40 (1 шаг) ИЛИ conf >= 0.24 при 3-кадровой коллинеарности (вброс мяча!)
+        if not history:
+            valid_starts = [
+                c for c in raw_cands
+                if (c[3] >= 0.40 and _has_kinematic_continuation(all_cands, i, c, static_balls, K, R, T, False))
+                or (c[3] >= 0.24 and _has_kinematic_continuation(all_cands, i, c, static_balls, K, R, T, True))
+            ]
+            if valid_starts:
+                best = max(valid_starts, key=lambda c: c[3])
+                chosen_list[i] = best
+                history = [(t, best[0], best[1], best[2], best[3])]
+                lost_in_fov = 0
+            continue
+
+        t_last, u_last, v_last, b_last, _ = history[-1]
+        dt_last = max(t - t_last, dt)
+
+        if len(history) >= 3:
+            pts_h = np.array(history[-min(len(history), 5):], dtype=float)
+            ts_h = pts_h[:, 0] - t_last
+            deg_h = 2 if len(pts_h) >= 4 else 1
+            pu = np.polyfit(ts_h, pts_h[:, 1], 1)
+            pv = np.polyfit(ts_h, pts_h[:, 2], deg_h)
+            u_pred = float(np.polyval(pu, dt_last))
+            v_pred = float(np.polyval(pv, dt_last))
+            vu = float(pu[0])
+            vv = float(pv[-2])
+        elif len(history) == 2:
+            t_prev, u_prev, v_prev, _, _ = history[-2]
+            dt_prev = max(t_last - t_prev, dt)
+            vu = (u_last - u_prev) / dt_prev
+            vv = (v_last - v_prev) / dt_prev
+            u_pred = u_last + vu * dt_last
+            v_pred = v_last + vv * dt_last + 0.5 * 650.0 * (dt_last ** 2)
+        else:
+            vu, vv = 0.0, 0.0
+            u_pred, v_pred = u_last, v_last
+
+        if v_pred < 12.0 and v_last < 98.0 and vv < -75.0 and len(history) >= 4:
+            top_cand = None
+            for c in raw_cands:
+                if c[1] < 105.0 and np.hypot(c[0] - u_pred, c[1] - max(v_pred, 0.0)) < 85.0:
+                    top_cand = c
+                    break
+            if top_cand is None:
+                pts = np.array(history[-min(len(history), 8):], dtype=float)
+                ts_rel = pts[:, 0] - pts[-1, 0]
+                poly_u = np.polyfit(ts_rel, pts[:, 1], 1)
+                poly_v = np.polyfit(ts_rel, pts[:, 2], 2)
+                a_v = max(float(poly_v[0]), 250.0)
+                above_poly_u = [float(u_last), float(poly_u[0])]
+                above_poly_v = [float(v_last), float(poly_v[1]), a_v]
+                t_exit = t_last
+                above_frame_mode = True
+                out_of_fov_list[i] = True
+                continue
+
+        best = None
+        best_score = float("inf")
+        max_gate = 120.0 + 25.0 * min(lost_in_fov, 3)
+
+        for c in raw_cands:
+            d_pred = np.hypot(c[0] - u_pred, c[1] - v_pred)
+            d_last = np.hypot(c[0] - u_last, c[1] - v_last)
+            d_eff = d_pred if len(history) >= 3 else min(d_pred, d_last * 1.1)
+
+            if d_eff > max_gate:
+                continue
+            if c[3] < 0.36 and d_pred > 48.0:
+                continue
+
+            box_jump = abs(c[2] - b_last) / max(b_last, 8.0)
+            if c[3] < 0.40 and box_jump > 0.65:
+                continue
+
+            la_bonus = 0.78 if _has_kinematic_continuation(all_cands, i, c, static_balls, K, R, T) else 1.15
+            score = (d_eff * (1.0 + 0.35 * box_jump) * la_bonus) / (max(c[3], 0.25) ** 0.7)
+
+            if score < best_score:
+                best_score, best = score, c
+
+        if best is not None:
+            chosen_list[i] = best
+            history.append((t, best[0], best[1], best[2], best[3]))
+            if len(history) > 25:
+                history.pop(0)
+            lost_in_fov = 0
+        else:
+            lost_in_fov += 1
+            if lost_in_fov > 6:
+                history = []
+                lost_in_fov = 0
+
+    chosen_list = _clean_2d_track_outliers(chosen_list, all_cands, static_balls, K, R, T)
+    return chosen_list, out_of_fov_list, static_balls
+
+
+def _is_free_flight_arc(arc_arr, K=None):
+    """
+    Проверяет, действительно ли мяч летит по воздуху под действием гравитации,
+    сверяя экранное ускорение d2v/dt2 с размером рамки YOLO (защита от мяча в руках).
+    """
+    if len(arc_arr) < 5:
+        return False
+
+    times = arc_arr[:, 0]
+    u = arc_arr[:, 1]
+    v = arc_arr[:, 2]
+    boxes = arc_arr[:, 3]
+
+    span_2d = float(np.hypot(u.max() - u.min(), v.max() - v.min()))
+    step_dt = np.maximum(np.diff(times), 1e-3)
+    step_spd = np.hypot(np.diff(u), np.diff(v)) / step_dt
+    med_spd_2d = float(np.median(step_spd))
+
+    # 1. Медленное движение или малый размах — мяч в руках игрока
+    if span_2d < 70.0 or med_spd_2d < 185.0:
+        return False
+
+    # 2. Сравнение вертикального ускорения на экране с ожидаемой гравитацией для данного размера бокса
+    tau = times - 0.5 * (times[0] + times[-1])
+    poly_v = np.polyfit(tau, v, 2)
+    a_v = 2.0 * float(poly_v[0])
+
+    f_eff = 0.5 * (K[0, 0] + K[1, 1]) if K is not None else 1150.0
+    med_box = float(np.median(boxes[boxes > 4.0])) if np.any(boxes > 4.0) else 18.0
+    z_est_box = f_eff * (2.0 * RADIUS) / max(med_box, 6.0)
+    # Ожидаемое экранное ускорение гравитации на глубине z_est_box
+    a_v_expected = (f_eff * 9.80665 * 0.85) / np.clip(z_est_box, 5.5, 32.0)
+
+    # Если экранное ускорение меньше 38% от гравитации на этой глубине и нет огромной скорости удара,
+    # значит мяч поддерживают руки игрока!
+    if a_v < 0.38 * a_v_expected and (med_spd_2d < 440.0 or span_2d < 180.0):
+        return False
+
+    return True
+
+
+def segment_rallies_and_arcs(chosen_list, out_of_fov_list, fps):
+    dt = 1.0 / fps
+    rallies = []
+    curr_rally = []
+    last_frame = None
+
+    for i, ch in enumerate(chosen_list):
+        if ch is not None:
+            if last_frame is not None:
+                gap = i - last_frame
+                was_above_fov = any(out_of_fov_list[last_frame + 1:i]) and ch[1] < 220.0
+                if (gap > 6 and not was_above_fov) or gap > 42:
+                    if len(curr_rally) >= 6:
+                        rallies.append(curr_rally)
+                    curr_rally = []
+            curr_rally.append([i * dt, ch[0], ch[1], ch[2], ch[3], i])
+            last_frame = i
+
+    if len(curr_rally) >= 6:
+        rallies.append(curr_rally)
+
+    stationary_frames = {}
+    all_rally_arcs = []
+
+    for rally in rallies:
+        arr = np.asarray(rally, dtype=float)
+        n = len(arr)
+
+        # 1. Отделяем фазы стояния/переноса мяча в руках игрока
+        is_stat = np.zeros(n, dtype=bool)
+        for k in range(n):
+            w_lo = max(0, k - 3)
+            w_hi = min(n, k + 4)
+            win = arr[w_lo:w_hi]
+            span = np.hypot(win[:, 1].max() - win[:, 1].min(), win[:, 2].max() - win[:, 2].min())
+            dt_win = max(float(win[-1, 0] - win[0, 0]), 1e-3)
+            avg_spd = span / dt_win
+
+            # Мяч в руках: либо малый размах (< 24 px), либо медленный перенос (< 130 px/s) без падения
+            if span < 24.0 or avg_spd < 125.0:
+                is_stat[k] = True
+                stationary_frames[int(arr[k, 5])] = (arr[k, 1], arr[k, 2], arr[k, 3])
+
+        active_chunks = []
+        curr_chunk = []
+        for k in range(n):
+            if not is_stat[k]:
+                if curr_chunk and (arr[k, 5] - curr_chunk[-1][5]) > 6:
+                    f_prev = int(curr_chunk[-1][5])
+                    f_curr = int(arr[k, 5])
+                    if not any(out_of_fov_list[f_prev + 1:f_curr]):
+                        if len(curr_chunk) >= 6:
+                            active_chunks.append(curr_chunk)
+                        curr_chunk = []
+                curr_chunk.append(rally[k])
+            else:
+                if len(curr_chunk) >= 6:
+                    active_chunks.append(curr_chunk)
+                curr_chunk = []
+        if len(curr_chunk) >= 6:
+            active_chunks.append(curr_chunk)
+
+        for chunk in active_chunks:
+            act = np.asarray(chunk, dtype=float)
+            m = len(act)
+            if m < 6:
+                for row in act:
+                    stationary_frames[int(row[5])] = (row[1], row[2], row[3])
+                continue
+
+            impulse_scores = np.zeros(m, dtype=float)
+            W = 3
+            G_PX_EST = 750.0
+
+            for k in range(W, m - W):
+                dt_in = float(act[k, 0] - act[k - W, 0])
+                dt_out = float(act[k + W, 0] - act[k, 0])
+                if dt_in > 0.30 or dt_out > 0.30 or dt_in < 1e-3 or dt_out < 1e-3:
+                    continue
+
+                v_in = (act[k, 1:3] - act[k - W, 1:3]) / dt_in
+                v_out = (act[k + W, 1:3] - act[k, 1:3]) / dt_out
+
+                dt_mid = 0.5 * (dt_in + dt_out)
+                dv_u = float(v_out[0] - v_in[0])
+                dv_v_raw = float(v_out[1] - v_in[1])
+                dv_v_nongrav = dv_v_raw - G_PX_EST * dt_mid
+
+                spd_out = float(np.hypot(v_out[0], v_out[1]))
+
+                upward_kick = max(0.0, -dv_v_raw - 210.0) if spd_out > 125.0 else 0.0
+                horiz_kick = max(0.0, abs(dv_u) - 230.0) if spd_out > 150.0 else 0.0
+                spike_kick = max(0.0, dv_v_nongrav - 270.0) if spd_out > 360.0 else 0.0
+
+                score = max(upward_kick, horiz_kick, spike_kick)
+                if score > 0.0:
+                    impulse_scores[k] = float(np.hypot(dv_u, dv_v_nongrav))
+
+            hit_indices = [0]
+            MIN_ARC_LEN = 7
+            for k in range(W, m - W):
+                if impulse_scores[k] <= 0.0:
+                    continue
+                lo = max(W, k - 4)
+                hi = min(m - W, k + 5)
+                if impulse_scores[k] == np.max(impulse_scores[lo:hi]):
+                    if k - hit_indices[-1] >= MIN_ARC_LEN and (m - 1 - k) >= 5:
+                        hit_indices.append(k)
+
+            hit_indices.append(m - 1)
+
+            for idx_pos in range(1, len(hit_indices) - 1):
+                s_prev = hit_indices[idx_pos - 1]
+                k_curr = hit_indices[idx_pos]
+                e_next = hit_indices[idx_pos + 1]
+                best_k = k_curr
+                best_err = float("inf")
+                for cand_k in range(max(s_prev + 4, k_curr - 2), min(e_next - 4, k_curr + 3)):
+                    seg1 = act[s_prev:cand_k + 1]
+                    seg2 = act[cand_k:e_next + 1]
+                    t1 = seg1[:, 0] - seg1[0, 0]
+                    t2 = seg2[:, 0] - seg2[0, 0]
+                    err1 = np.sum(np.abs(np.polyval(np.polyfit(t1, seg1[:, 2], min(2, len(t1) - 1)), t1) - seg1[:, 2]))
+                    err2 = np.sum(np.abs(np.polyval(np.polyfit(t2, seg2[:, 2], min(2, len(t2) - 1)), t2) - seg2[:, 2]))
+                    if err1 + err2 < best_err:
+                        best_err = err1 + err2
+                        best_k = cand_k
+                hit_indices[idx_pos] = best_k
+
+            # Разбиваем на непрерывные цепочки ТОЛЬКО тех дуг, которые прошли тест свободного полета
+            curr_valid_arcs = []
+            for idx_i in range(len(hit_indices) - 1):
+                s_i = hit_indices[idx_i]
+                e_i = hit_indices[idx_i + 1]
+                sub_arc = act[s_i:e_i + 1]
+                if len(sub_arc) >= 5 and _is_free_flight_arc(sub_arc):
+                    curr_valid_arcs.append(sub_arc)
+                else:
+                    # Небаллистический сегмент (мяч в руках у игрока!) -> помечаем как 0.0 km/h
+                    for row in sub_arc:
+                        stationary_frames[int(row[5])] = (row[1], row[2], row[3])
+                    if curr_valid_arcs:
+                        all_rally_arcs.append(curr_valid_arcs)
+                        curr_valid_arcs = []
+
+            if curr_valid_arcs:
+                all_rally_arcs.append(curr_valid_arcs)
+
+    return all_rally_arcs, stationary_frames
+
+
+def refine_detections_with_3d_physics(chosen_list, frame_3d_map, all_cands, static_balls, K, R, T):
+    refined = list(chosen_list)
+    recovered_cnt = 0
+    pruned_cnt = 0
+
+    for f_idx, info3d in frame_3d_map.items():
+        if f_idx < 0 or f_idx >= len(refined):
+            continue
+        state = info3d["state"]
+        if float(info3d["speed"]) < 0.1:
+            continue
+        (u_phys, v_phys), _ = project(state, K, R, T)
+        if not (np.isfinite(u_phys) and np.isfinite(v_phys)):
+            continue
+
+        curr = refined[f_idx]
+        if curr is not None:
+            dist_curr = np.hypot(curr[0] - u_phys, curr[1] - v_phys)
+            if dist_curr <= 24.0:
+                continue
+            pruned_cnt += 1
+            refined[f_idx] = None
+
+        best_c = None
+        best_d = 26.0
+        for c in all_cands[f_idx]:
+            if is_static_false_positive(c[0], c[1], static_balls):
+                continue
+            if not is_valid_ball_candidate(c, K, R, T, is_tracking=True):
+                continue
+            d = np.hypot(c[0] - u_phys, c[1] - v_phys)
+            if d < best_d:
+                best_d, best_c = d, c
+
+        if best_c is not None:
+            refined[f_idx] = best_c
+            recovered_cnt += 1
+
+    print(f"  Физическая фильтрация: подтянуто пропущенных/точных боксов: {recovered_cnt}, "
+          f"удалено ложных выбросов: {pruned_cnt}")
+    return refined
+
+
+def draw_frame(frame, chosen, state, speed, v0_kmh, K, R, T, hit=False, out_of_fov=False):
+    h, w = frame.shape[:2]
+    if state is not None:
+        (u_phys, v_phys), _ = project(state, K, R, T)
+        color_phys = (255, 140, 0) if chosen is None else (0, 200, 255)
+        if np.isfinite(u_phys) and np.isfinite(v_phys):
+            u_i = int(np.clip(u_phys, 15, w - 240))
+            v_i = int(np.clip(v_phys, 35, h - 20))
+            if 0 <= u_phys < w and 0 <= v_phys < h:
+                cv2.circle(frame, (int(round(u_phys)), int(round(v_phys))), 5, color_phys, -1)
+            label = f"{speed * 3.6:.1f} km/h"
+            if v0_kmh > 1.0:
+                label += f" (v0: {v0_kmh:.0f})"
+            cv2.putText(frame, label, (u_i + 12, v_i - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
 
     if chosen is not None:
         cx, cy, box_size, conf, (x1, y1, x2, y2) = chosen
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(frame, f"YOLO {conf:.2f}", (x1, max(y1 - 10, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    else:
-        cv2.putText(frame, f"PHYSICS ONLY (lost {frames_lost})", (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
-
-    cv2.putText(frame, f"{speed * 3.6:.1f} km/h", (int(u_phys) + 12, int(v_phys) - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    elif out_of_fov:
+        cv2.putText(frame, "BALL ABOVE FRAME (3D parabolic arc)", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 180, 0), 2)
 
     if hit:
         cv2.putText(frame, "HIT!", (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
@@ -234,121 +611,124 @@ def draw_frame(frame, chosen, state, speed, K, R, T, hit=False, frames_lost=0):
 
 def main():
     K, R, T = load_calib(CALIB_PATH)
-    model = YOLO(YOLO_WEIGHTS)
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        raise RuntimeError(f"Не удалось открыть видео: {VIDEO_PATH}")
+    z_cmin, z_ccenter, z_cmax = court_depth_stats(K, R, T)
+    print(f"Геометрия площадки по калибровке: глубина Z_cam от {z_cmin:.1f} м "
+          f"до {z_cmax:.1f} м (центр корта: {z_ccenter:.1f} м)")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    dt_nominal = 1.0 / fps
+    cache = extract_or_load_yolo_detections(VIDEO_PATH, YOLO_WEIGHTS)
+    fps = cache["fps"]
+    all_cands = cache["all_cands"]
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
 
-    log_rows = []  # t, u, v, box_size, conf, updated(bool), hit(bool), speed(m/s)
-    bootstrap_rows = []    # [t, u, v, box_size] — только точки с валидным box_size
-    bootstrap_frames = []  # (t, frame_copy, chosen)
-    last_center = None
-    t = 0.0
-    frame_idx = 0
-    ekf = None
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    dt_nominal = 1.0 / fps
-    frames_buf = collect_bootstrap_candidates(cap, model, dt_nominal, n_candidates=80)
-    clean_rows = None
-    while clean_rows is None:
-        clean_rows = select_clean_window_manual(frames_buf)
-        if clean_rows is None:
-            extra = collect_bootstrap_candidates(cap, model, dt_nominal,
-                                              t_start=frames_buf[-1][0] + dt_nominal, n_candidates=40)
-            frames_buf += extra
+    print("\n[Проход 1/4] Look-Ahead 2D-трекинг и фильтрация ложных боксов...")
+    chosen_list, out_of_fov_list, static_balls = track_2d_video(all_cands, fps, width, height, K, R, T)
+    all_rally_arcs, stationary_frames = segment_rallies_and_arcs(chosen_list, out_of_fov_list, fps)
+    box_scale = calibrate_box_scale(all_rally_arcs, K, R, T)
+    print(f"  Первичная калибровка масштаба боксов YOLO: x{box_scale:.2f}")
 
-    state0 = init_state_robust(clean_rows, K, R, T, lambda_box=0.2)
-    ekf = BallEKF(K, R, T, dt=dt_nominal, process_accel_std=3.0,
-              meas_px_std=MEAS_PX_STD, meas_depth_std=MEAS_DEPTH_STD,
-              gate_chi2=GATE_CHI2)
-    t0 = clean_rows[0][0]
-    ekf.init_state(t0, state0[:3], state0[3:])
-    print(f"EKF инициализирован: pos0={state0[:3].round(2)}  v0={state0[3:].round(2)} м/с "
-        f"(|v0|={np.linalg.norm(state0[3:]) * 3.6:.1f} км/ч)")
+    print("\n[Проход 2/4] Первичная 3D-реконструкция для физической верификации трека...")
+    pass1_3d_map = {}
+    for arcs in all_rally_arcs:
+        res_map, _ = solve_connected_rally_arcs(arcs, K, R, T, box_scale=box_scale, refine_6d=False)
+        pass1_3d_map.update(res_map)
 
-    MAX_REALISTIC_SPEED = 45.0
-    if np.linalg.norm(state0[3:]) > MAX_REALISTIC_SPEED:
-        print("ВНИМАНИЕ: |v0| всё ещё нефизична даже после ручного выбора — "
-            "проверь порядок кликов калибровки или сам выбор окна")
-    start_t = clean_rows[0][0]
-    for ft, frame, chosen in frames_buf:
-        if ft < start_t:
-            continue
-        cx = cy = box_size = conf = None
-        uv = None
-        if chosen is not None:
-            cx, cy, box_size, conf, _ = chosen
-            uv = (cx, cy)
-        x = ekf.step(ft, uv, box_size, conf if conf is not None else 1.0)
-        speed = float(np.linalg.norm(x[3:]))
-        hit = ekf.history[-1]["hit"]
-        log_rows.append([ft, cx if uv else np.nan, cy if uv else np.nan,
-                        box_size if box_size else np.nan,
-                        conf if conf is not None else np.nan,
-                        uv is not None, hit, speed])
-        draw_frame(frame, chosen, x, speed, K, R, T, hit)
-        writer.write(frame)
+    print("\n[Проход 3/4] Обратный проход 3D-физикой по кэшу YOLO и уточнение ударов...")
+    chosen_list = refine_detections_with_3d_physics(
+        chosen_list, pass1_3d_map, all_cands, static_balls, K, R, T
+    )
+    all_rally_arcs, stationary_frames = segment_rallies_and_arcs(chosen_list, out_of_fov_list, fps)
+    total_arcs = sum(len(r) for r in all_rally_arcs)
+    box_scale = calibrate_box_scale(all_rally_arcs, K, R, T)
+    print(f"  После уточнения: эпизодов = {len(all_rally_arcs)}, чистых дуг = {total_arcs}, box_scale = x{box_scale:.2f}")
 
-    t = frames_buf[-1][0] + dt_nominal
-    frame_idx = len(frames_buf)
+    print("\n[Проход 4/4] Финальная 3D-реконструкция с по-кадровым 6D Bundle Adjustment:")
+    frame_3d_map = {}
+    total_hits = 0
+    for r_idx, arcs in enumerate(all_rally_arcs):
+        res_map, summaries = solve_connected_rally_arcs(arcs, K, R, T, box_scale=box_scale, refine_6d=True)
+        frame_3d_map.update(res_map)
+        for info in res_map.values():
+            if info["hit"]:
+                total_hits += 1
+        arc_strs = [
+            f"[{s['t_start']:.1f}-{s['t_end']:.1f}s | Z:{s['z0']:.1f}->{s['z1']:.1f}m | "
+            f"v0={s['v0_kmh']:.1f} км/ч, ср={s['v_mean_kmh']:.1f} км/ч]"
+            for s in summaries
+        ]
+        print(f"  Эпизод #{r_idx + 1:02d}: " + " -> ".join(arc_strs))
 
-    frames_lost = 0
-    while True:
+    for f_idx, (u_s, v_s, b_s) in stationary_frames.items():
+        if f_idx not in frame_3d_map:
+            z_bnds = ray_court_depth_bounds((u_s, v_s), K, R, T)
+            pos_s = triangulate_from_depth((u_s, v_s), 0.5 * (z_bnds[0] + z_bnds[1]), K, R, T)
+            frame_3d_map[f_idx] = dict(
+                state=np.hstack([pos_s, [0.0, 0.0, 0.0]]),
+                speed=0.0,
+                v0_kmh=0.0,
+                hit=False,
+            )
+
+    print("\nЗапись итогового видео и лога траектории...")
+    log_rows = []
+    dt = 1.0 / fps
+    show_preview = SHOW_LIVE_PREVIEW
+
+    for i in range(len(all_cands)):
         ret, frame = cap.read()
         if not ret:
             break
-        cands = yolo_detect(model, frame)
-        dt = t - ekf._t_prev
-        x_pred, P_pred = predict_peek(ekf, max(dt, 1e-6))
+        t = i * dt
+        chosen = chosen_list[i]
+        out_of_fov = out_of_fov_list[i]
+        info3d = frame_3d_map.get(i, None)
 
-        chosen, nis = gate_and_pick(cands, x_pred, P_pred, K, R, T, frames_lost)
-
-        cx = cy = box_size = conf = None
-        uv = None
+        cx = cy = box_size = conf = np.nan
+        updated = False
         if chosen is not None:
             cx, cy, box_size, conf, _ = chosen
-            uv = (cx, cy)
-            frames_lost = 0
+            updated = True
+
+        if info3d is not None:
+            state = info3d["state"]
+            speed = info3d["speed"]
+            v0_kmh = info3d.get("v0_kmh", 0.0)
+            hit = info3d["hit"]
         else:
-            frames_lost += 1
-        x = ekf.step(t, uv, box_size, conf if conf is not None else 1.0)
-        speed = float(np.linalg.norm(x[3:]))
-        hit = ekf.history[-1]["hit"]
+            state = None
+            speed = np.nan
+            v0_kmh = 0.0
+            hit = False
 
-        log_rows.append([t, cx if uv else np.nan, cy if uv else np.nan,
-                          box_size if box_size else np.nan,
-                          conf if conf is not None else np.nan,
-                          uv is not None, hit, speed])
+        log_rows.append([
+            t, cx, cy, box_size, conf,
+            updated, hit, speed, 0.0
+        ])
 
-        draw_frame(frame, chosen, x, speed, K, R, T, hit, frames_lost)
+        draw_frame(
+            frame, chosen, state,
+            speed if np.isfinite(speed) else 0.0,
+            v0_kmh, K, R, T, hit=hit, out_of_fov=out_of_fov
+        )
         writer.write(frame)
 
-        t += dt_nominal
-        frame_idx += 1
-        if frame_idx % 100 == 0:
-            print(f"  обработано кадров: {frame_idx}  текущая скорость: {speed * 3.6:.1f} км/ч")
+        if show_preview:
+            cv2.imshow("live", frame)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                show_preview = False
+                cv2.destroyWindow("live")
 
+    cv2.destroyAllWindows()
     cap.release()
     writer.release()
 
     log_arr = np.array(log_rows, dtype=float)
     np.save(OUTPUT_TRAJECTORY, log_arr)
-
-    print(f"\nГотово. Кадров обработано: {frame_idx}.")
-    print(f"Ударов / резких смен скорости обнаружено: {len(ekf.events)}")
-    for ev in ekf.events:
-        print(f"  t={ev['t']:.2f}s  |v| до={ev['speed_before'] * 3.6:.1f} км/ч -> "
-              f"после={ev['speed_after'] * 3.6:.1f} км/ч")
-    print(f"Видео сохранено: {OUTPUT_VIDEO}")
-    print(f"Лог траектории+скорости сохранён: {OUTPUT_TRAJECTORY}")
-    print("  колонки: t, u, v, box_size, conf, updated(bool), hit(bool), speed(m/s)")
+    print(f"\nГотово! Обработано кадров: {len(log_rows)}, обнаружено ударов: {total_hits}")
 
 
 if __name__ == "__main__":
